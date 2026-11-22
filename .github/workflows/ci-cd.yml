@@ -73,7 +73,7 @@ jobs:
       - run: pip install cfn-lint
       - name: cfn-lint
         run: cfn-lint template.yaml infra/*.yaml
-      - uses: aws-actions/setup-sam@v2
+      - uses: aws-actions/setup-sam@v3
         with:
           use-installer: true
       - name: sam build
@@ -97,7 +97,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-      - uses: aws-actions/setup-sam@v2
+      - uses: aws-actions/setup-sam@v3
         with:
           use-installer: true
       - uses: aws-actions/configure-aws-credentials@v4
