@@ -1,0 +1,30 @@
+version = 0.1
+
+[default.global.parameters]
+stack_name = "transacoes-async-api-dev"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.validate.parameters]
+lint = true
+
+[default.deploy.parameters]
+stack_name = "transacoes-async-api-dev"
+region = "us-east-1"
+resolve_s3 = true
+s3_prefix = "transacoes-async-api"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+parameter_overrides = "Ambiente=\"dev\""
+
+[dev.deploy.parameters]
+stack_name = "transacoes-async-api-dev"
+region = "us-east-1"
+resolve_s3 = true
+s3_prefix = "transacoes-async-api"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = false
+fail_on_empty_changeset = false
+parameter_overrides = "Ambiente=\"dev\""

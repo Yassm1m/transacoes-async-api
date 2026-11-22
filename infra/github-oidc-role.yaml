@@ -1,0 +1,106 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Role que o GitHub Actions assume via OIDC para fazer deploy, sem chaves de acesso
+  guardadas em secrets. Rode uma vez por conta AWS.
+
+Parameters:
+  GitHubOrg:
+    Type: String
+    Description: "Usuário ou organização do GitHub (ex.: seu-usuario)"
+  RepositoryName:
+    Type: String
+    Default: transacoes-async-api
+  CriarProvedorOIDC:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Use "false" se a conta já tiver o provedor token.actions.githubusercontent.com
+
+Conditions:
+  CriarProvedor: !Equals [!Ref CriarProvedorOIDC, "true"]
+
+Resources:
+  GitHubOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CriarProvedor
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${RepositoryName}-github-deploy
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                # Só a branch main (ou o environment "dev") deste repositório pode assumir.
+                token.actions.githubusercontent.com:sub:
+                  - !Sub repo:${GitHubOrg}/${RepositoryName}:ref:refs/heads/main
+                  - !Sub repo:${GitHubOrg}/${RepositoryName}:environment:dev
+      Policies:
+        - PolicyName: deploy-sam
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: CloudFormation
+                Effect: Allow
+                Action: cloudformation:*
+                Resource:
+                  - !Sub arn:aws:cloudformation:*:${AWS::AccountId}:stack/${RepositoryName}-*/*
+                  - !Sub arn:aws:cloudformation:*:${AWS::AccountId}:stack/aws-sam-cli-managed-default/*
+                  - arn:aws:cloudformation:*:aws:transform/Serverless-2016-10-31
+              - Sid: CloudFormationLeitura
+                Effect: Allow
+                Action:
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:ListStacks
+                Resource: "*"
+              - Sid: ArtefatosSAM
+                Effect: Allow
+                Action: s3:*
+                Resource:
+                  - arn:aws:s3:::aws-sam-cli-managed-default-*
+                  - !Sub arn:aws:s3:::${RepositoryName}-*
+              - Sid: RecursosDaStack
+                Effect: Allow
+                Action:
+                  - lambda:*
+                  - apigateway:*
+                  - sqs:*
+                  - sns:*
+                  - dynamodb:*
+                  - logs:*
+                  - cloudwatch:*
+                  - s3:*
+                  - xray:*
+                Resource: "*"
+              - Sid: RolesDasFuncoes
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:PassRole
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/${RepositoryName}-*
+
+Outputs:
+  DeployRoleArn:
+    Description: Cole em Settings > Secrets and variables > Actions > Variables > AWS_DEPLOY_ROLE_ARN
+    Value: !GetAtt GitHubDeployRole.Arn

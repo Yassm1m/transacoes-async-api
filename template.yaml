@@ -1,0 +1,342 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  API de Processamento de Transações Assíncronas - API Gateway (HTTP API), Lambda,
+  SQS com DLQ, SNS, S3 e DynamoDB, com alarmes no CloudWatch.
+
+Parameters:
+  Ambiente:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  EmailAlarmes:
+    Type: String
+    Default: ""
+    Description: E-mail que recebe os alarmes (opcional; confirme a inscrição no e-mail recebido)
+  FalhaSimuladaPercentual:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    MaxValue: 100
+    Description: Percentual de falhas transitórias injetadas no processador simulado (teste de resiliência)
+
+Conditions:
+  TemEmailAlarmes: !Not [!Equals [!Ref EmailAlarmes, ""]]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    CodeUri: src/
+    MemorySize: 256
+    Timeout: 10
+    Tracing: Active
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref TransacoesTable
+        QUEUE_URL: !Ref ProcessamentoQueue
+        TOPIC_ARN: !Ref EventosTopic
+        BUCKET_NAME: !Ref ComprovantesBucket
+        FALHA_SIMULADA_PERCENTUAL: !Ref FalhaSimuladaPercentual
+        LOG_LEVEL: INFO
+    Tags:
+      projeto: transacoes-async-api
+      ambiente: !Ref Ambiente
+
+Resources:
+  # ------------------------------------------------------------------ dados
+  TransacoesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expira_em
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  ComprovantesBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: comprovantes-para-armazenamento-frio
+            Status: Enabled
+            Prefix: comprovantes/
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER_IR
+                TransitionInDays: 90
+
+  ComprovantesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ComprovantesBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: SomenteHTTPS
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt ComprovantesBucket.Arn
+              - !Sub "${ComprovantesBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # ------------------------------------------------------------- mensageria
+  ProcessamentoDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600 # 14 dias para investigar e fazer redrive
+      SqsManagedSseEnabled: true
+
+  ProcessamentoQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      # Recomendação da AWS: pelo menos 6x o timeout da função consumidora.
+      VisibilityTimeout: 180
+      MessageRetentionPeriod: 345600 # 4 dias
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ProcessamentoDLQ.Arn
+        maxReceiveCount: 3
+
+  ProcessamentoDLQPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref ProcessamentoDLQ]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: SomenteHTTPS
+            Effect: Deny
+            Principal: "*"
+            Action: "sqs:*"
+            Resource: !GetAtt ProcessamentoDLQ.Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  EventosTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      KmsMasterKeyId: alias/aws/sns
+
+  AlarmesTopic:
+    Type: AWS::SNS::Topic
+
+  AlarmesEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: TemEmailAlarmes
+    Properties:
+      TopicArn: !Ref AlarmesTopic
+      Protocol: email
+      Endpoint: !Ref EmailAlarmes
+
+  # -------------------------------------------------------------------- API
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 50
+        ThrottlingRateLimit: 100
+      AccessLogSettings:
+        DestinationArn: !GetAtt HttpApiAccessLogs.Arn
+        Format: >-
+          {"requestId":"$context.requestId","ip":"$context.identity.sourceIp",
+          "metodo":"$context.httpMethod","rota":"$context.routeKey",
+          "status":"$context.status","latencia_ms":"$context.responseLatency",
+          "erro_integracao":"$context.integrationErrorMessage"}
+
+  HttpApiAccessLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 14
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Recebe e consulta transações (FastAPI via Mangum)
+      Handler: transacoes.adapters.inbound.http.lambda_handler.handler
+      Environment:
+        Variables:
+          SERVICO: transacoes-api
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TransacoesTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ProcessamentoQueue.QueueName
+      Events:
+        Proxy:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /{proxy+}
+            Method: ANY
+
+  ApiFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ApiFunction}
+      RetentionInDays: 14
+
+  # ----------------------------------------------------------------- worker
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Consome a fila e processa transações
+      Handler: transacoes.adapters.inbound.sqs_worker.handler
+      Timeout: 30
+      Environment:
+        Variables:
+          SERVICO: transacoes-worker
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TransacoesTable
+        - S3WritePolicy:
+            BucketName: !Ref ComprovantesBucket
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt EventosTopic.TopicName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:GenerateDataKey*
+                - kms:Decrypt
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  kms:ViaService: !Sub sns.${AWS::Region}.amazonaws.com
+      Events:
+        Fila:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ProcessamentoQueue.Arn
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 1
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+            ScalingConfig:
+              MaximumConcurrency: 5 # protege o processador externo de picos
+
+  WorkerFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${WorkerFunction}
+      RetentionInDays: 14
+
+  # ---------------------------------------------------------- observabilidade
+  DLQComMensagensAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Há transações na DLQ - falharam 3 vezes e precisam de análise/redrive
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ProcessamentoDLQ.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmesTopic]
+      OKActions: [!Ref AlarmesTopic]
+
+  FilaAtrasadaAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Mensagem mais antiga da fila com mais de 5 minutos - worker não está dando conta
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ProcessamentoQueue.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 300
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmesTopic]
+
+  WorkerErrosAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Erros não tratados no Lambda worker
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref WorkerFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmesTopic]
+
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: API retornando erros 5xx
+      Namespace: AWS/ApiGateway
+      MetricName: 5xx
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref HttpApi
+        - Name: Stage
+          Value: $default
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmesTopic]
+
+Outputs:
+  ApiUrl:
+    Description: URL base da API
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com
+  TabelaTransacoes:
+    Value: !Ref TransacoesTable
+  FilaProcessamentoUrl:
+    Value: !Ref ProcessamentoQueue
+  DLQUrl:
+    Value: !Ref ProcessamentoDLQ
+  TopicoEventosArn:
+    Value: !Ref EventosTopic
+  BucketComprovantes:
+    Value: !Ref ComprovantesBucket

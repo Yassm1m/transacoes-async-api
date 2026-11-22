@@ -1,0 +1,59 @@
+[project]
+name = "transacoes-async-api"
+version = "1.0.0"
+description = "API de processamento assíncrono de transações com arquitetura hexagonal na AWS (Lambda, API Gateway, SQS, SNS, S3, DynamoDB)"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+extend-exclude = [".aws-sam"]
+
+[tool.ruff.lint]
+select = [
+  "E", "W",   # pycodestyle
+  "F",        # pyflakes
+  "I",        # isort
+  "B",        # bugbear
+  "UP",       # pyupgrade
+  "SIM",      # simplificações
+  "C4",       # comprehensions
+  "RUF",      # regras do próprio ruff
+  "S",        # bandit (segurança)
+]
+ignore = [
+  "RUF001", "RUF002", "RUF003",  # acentos em strings/comentários são intencionais (pt-BR)
+  "B008",                        # Header(...) como default é o padrão do FastAPI
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "S311"]
+"src/transacoes/adapters/outbound/processador_simulado.py" = ["S311"]  # random não-criptográfico é ok aqui
+"src/transacoes/shared/resiliencia.py" = ["S311"]                      # jitter não precisa de CSPRNG
+"scripts/**" = ["S311", "T201"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["transacoes"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+  "integration: testes que usam moto para simular serviços AWS",
+]
+filterwarnings = ["ignore::DeprecationWarning:botocore.*"]
+
+[tool.coverage.run]
+source = ["src/transacoes"]
+branch = true
+omit = ["src/transacoes/adapters/inbound/http/lambda_handler.py"]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+skip_covered = true
+exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "raise NotImplementedError"]
