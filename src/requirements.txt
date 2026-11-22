@@ -1,6 +1,6 @@
 # Dependências de runtime empacotadas no Lambda pelo `sam build`.
 # boto3 já vem na runtime do Lambda, mas fixamos para ter a mesma versão em todo lugar.
-fastapi>=0.115,<1.0
-pydantic>=2.9,<3.0
-mangum>=0.19,<1.0
-boto3>=1.35,<2.0
+fastapi>=0.165.0,<1.0
+pydantic>=2.14.3,<3.0
+mangum>=0.22.0,<1.0
+boto3>=1.44.6,<2.0
